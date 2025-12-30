@@ -146,6 +146,21 @@ app, rt = fast_app(
             .btn-browse:hover {
                 background: #5a6268;
             }
+            .btn-danger {
+                background: #dc3545;
+                margin-top: 10px;
+            }
+            .btn-danger:hover {
+                background: #c82333;
+            }
+            .action-buttons {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            .result-item.warning {
+                color: #856404;
+            }
         """)
     ]
 )
@@ -223,6 +238,85 @@ def extract_zip(zip_path: Path) -> dict:
     return result
 
 
+def is_zip_extracted(zip_path: Path) -> dict:
+    """
+    Overí, či je ZIP súbor správne extrahovaný.
+    Kontroluje, či existuje priečinok s rovnakým názvom a obsahuje všetky súbory.
+    """
+    result = {
+        "path": zip_path,
+        "extracted": False,
+        "can_delete": False,
+        "message": "",
+        "zip_size": 0
+    }
+
+    extract_dir = zip_path.parent / zip_path.stem
+    result["zip_size"] = zip_path.stat().st_size
+
+    # Kontrola, či existuje cieľový priečinok
+    if not extract_dir.exists():
+        result["message"] = "Priečinok s extrahovanými súbormi neexistuje"
+        return result
+
+    if not extract_dir.is_dir():
+        result["message"] = "Cieľová cesta nie je priečinok"
+        return result
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Získanie zoznamu súborov v ZIP
+            zip_members = set()
+            for info in zf.infolist():
+                if not info.is_dir():
+                    zip_members.add(info.filename)
+
+            # Kontrola, či všetky súbory existujú
+            missing_files = []
+            for member in zip_members:
+                member_path = extract_dir / member
+                if not member_path.exists():
+                    missing_files.append(member)
+
+            if missing_files:
+                result["message"] = f"Chýba {len(missing_files)} súborov"
+                result["extracted"] = False
+            else:
+                result["extracted"] = True
+                result["can_delete"] = True
+                result["message"] = f"OK ({len(zip_members)} súborov overených)"
+
+    except zipfile.BadZipFile:
+        result["message"] = "Poškodený ZIP súbor"
+    except Exception as e:
+        result["message"] = f"Chyba: {str(e)}"
+
+    return result
+
+
+def delete_zip_file(zip_path: Path) -> dict:
+    """Vymaže ZIP súbor."""
+    result = {
+        "path": zip_path,
+        "deleted": False,
+        "message": "",
+        "freed_size": 0
+    }
+
+    try:
+        size = zip_path.stat().st_size
+        zip_path.unlink()
+        result["deleted"] = True
+        result["freed_size"] = size
+        result["message"] = "Vymazaný"
+    except PermissionError:
+        result["message"] = "Nedostatočné oprávnenia"
+    except Exception as e:
+        result["message"] = f"Chyba: {str(e)}"
+
+    return result
+
+
 def open_directory_dialog() -> str:
     """Otvorí GUI dialóg pre výber adresára pomocou yad."""
     try:
@@ -287,9 +381,12 @@ def get():
                     Label(" Rekurzívne (vrátane podadresárov)", fr="recursive"),
                     cls="checkbox-group"
                 ),
-                Button("Spustiť extrakciu", type="submit"),
-                method="post",
-                action="/extract"
+                Div(
+                    Button("Extrahovať ZIP súbory", type="submit", formaction="/extract"),
+                    Button("Vymazať extrahované ZIP súbory", type="submit", formaction="/cleanup", cls="btn-danger"),
+                    cls="action-buttons"
+                ),
+                method="post"
             ),
             cls="container"
         )
@@ -401,6 +498,140 @@ def post(directory: str, recursive: bool = False):
             cls="results"
         ),
         A("← Nová extrakcia", href="/", cls="back-link"),
+        cls="container"
+    )
+
+
+@rt("/cleanup")
+def post(directory: str, recursive: bool = False):
+    """Vymaže ZIP súbory, ktoré boli úspešne extrahované."""
+    path = Path(directory).expanduser().resolve()
+
+    # Validácia adresára
+    if not path.exists():
+        return Titled("ZIP Extractor",
+            Div(
+                Div(f"Adresár '{directory}' neexistuje!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container"
+            )
+        )
+
+    if not path.is_dir():
+        return Titled("ZIP Extractor",
+            Div(
+                Div(f"'{directory}' nie je adresár!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container"
+            )
+        )
+
+    # Vyhľadanie ZIP súborov
+    zip_files = find_zip_files(path, recursive)
+
+    if not zip_files:
+        return Titled("ZIP Extractor",
+            Div(
+                Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container"
+            )
+        )
+
+    # Kontrola a mazanie
+    stats = {
+        "found": len(zip_files),
+        "extracted": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "failed": 0,
+        "freed_size": 0
+    }
+    results = []
+
+    for zip_file in zip_files:
+        # Najprv overíme, či je ZIP extrahovaný
+        check_result = is_zip_extracted(zip_file)
+
+        if check_result["can_delete"]:
+            stats["extracted"] += 1
+            # Vymazať ZIP
+            delete_result = delete_zip_file(zip_file)
+            if delete_result["deleted"]:
+                stats["deleted"] += 1
+                stats["freed_size"] += delete_result["freed_size"]
+                results.append({
+                    "path": zip_file,
+                    "status": "deleted",
+                    "message": f"Vymazaný (uvoľnené {format_size(delete_result['freed_size'])})"
+                })
+            else:
+                stats["failed"] += 1
+                results.append({
+                    "path": zip_file,
+                    "status": "error",
+                    "message": f"Chyba mazania: {delete_result['message']}"
+                })
+        else:
+            stats["skipped"] += 1
+            results.append({
+                "path": zip_file,
+                "status": "skipped",
+                "message": f"Preskočený: {check_result['message']}"
+            })
+
+    # Vytvorenie výstupu
+    result_items = []
+    for r in results:
+        relative_path = r["path"].relative_to(path) if r["path"].is_relative_to(path) else r["path"]
+        if r["status"] == "deleted":
+            result_items.append(
+                Div(f"✓ {relative_path} - {r['message']}", cls="result-item success")
+            )
+        elif r["status"] == "skipped":
+            result_items.append(
+                Div(f"⚠ {relative_path} - {r['message']}", cls="result-item warning")
+            )
+        else:
+            result_items.append(
+                Div(f"✗ {relative_path} - {r['message']}", cls="result-item error")
+            )
+
+    return Titled("ZIP Extractor - Čistenie",
+        Div(
+            H2("Štatistika čistenia"),
+            Div(
+                Div(
+                    Div(str(stats["found"]), cls="stat-value"),
+                    Div("Nájdených ZIP", cls="stat-label"),
+                    cls="stat-item"
+                ),
+                Div(
+                    Div(str(stats["deleted"]), cls="stat-value"),
+                    Div("Vymazaných", cls="stat-label"),
+                    cls="stat-item"
+                ),
+                Div(
+                    Div(str(stats["skipped"]), cls="stat-value"),
+                    Div("Preskočených", cls="stat-label"),
+                    cls="stat-item"
+                ),
+                Div(
+                    Div(str(stats["failed"]), cls="stat-value"),
+                    Div("Zlyhané", cls="stat-label"),
+                    cls="stat-item"
+                ),
+                cls="stats-grid"
+            ),
+            P(f"Uvoľnené miesto: {format_size(stats['freed_size'])}"),
+            cls="stats"
+        ),
+        Div(
+            H3("Detail operácií"),
+            *result_items,
+            cls="results"
+        ),
+        A("← Späť", href="/", cls="back-link"),
         cls="container"
     )
 
