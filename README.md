@@ -40,6 +40,7 @@ Otvor `http://localhost:5001` (default FastHTML).
 - `unzip_app/log_utils.py` - logovanie operacii
 - `unzip_app/zip_ops.py` - vykonne operacie so ZIP subormi
 - `unzip_app/web.py` - UI a HTTP routes
+- `unzip_app/static/favicon.ico` - favicon aplikacie
 - `unzip_app/__init__.py` - verejne exporty balika
 
 ## Konfiguracia (ENV)

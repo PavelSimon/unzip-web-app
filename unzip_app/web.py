@@ -10,6 +10,8 @@ import itertools
 import subprocess
 import uuid
 
+from starlette.responses import FileResponse
+
 from .config import ALLOW_ANY_PATH, BASE_DIR, LOG_DIR, MAX_WORKERS
 from .log_utils import log_event
 from .zip_ops import (
@@ -22,8 +24,11 @@ from .zip_ops import (
 
 __all__ = ["app", "rt", "format_size"]
 
+FAVICON_PATH = Path(__file__).resolve().parent / "static" / "favicon.ico"
+
 app, rt = fast_app(
     hdrs=[
+        Link(rel="icon", href="/favicon.ico"),
         Style("""
             body {
                 font-family: system-ui, -apple-system, sans-serif;
@@ -264,6 +269,14 @@ def open_directory_dialog() -> str:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return ""
+
+
+@rt("/favicon.ico")
+def get():
+    """Serve the application favicon."""
+    if not FAVICON_PATH.exists():
+        return Div(Div("favicon.ico nenajdeny", cls="error-message"))
+    return FileResponse(FAVICON_PATH, media_type="image/x-icon")
 
 
 def _apply_result(operation: Operation, result: dict[str, object]) -> None:
