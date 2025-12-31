@@ -7,12 +7,13 @@ from dataclasses import dataclass, field
 from threading import Lock, Thread
 from typing import Iterable
 import subprocess
+import time
 import uuid
 
 from starlette.responses import FileResponse
 
 from .config import ALLOW_ANY_PATH, BASE_DIR, LOG_DIR, MAX_WORKERS
-from .log_utils import log_event
+from .log_utils import log_event, sanitize_log_message
 from .zip_ops import (
     delete_zip_file,
     extract_zip,
@@ -205,6 +206,12 @@ app, rt = fast_app(
     ]
 )
 
+OPERATION_TTL = 3600  # 1 hour - operations older than this are cleaned up
+
+# Alias for use in exception handlers
+_sanitize_log_message = sanitize_log_message
+
+
 @dataclass
 class Operation:
     """Track the state of a background extraction operation."""
@@ -215,6 +222,7 @@ class Operation:
     parallel: bool
     delete_after: bool
     log_path: Path
+    created_at: float = field(default_factory=time.time)
     stats: dict[str, int] = field(
         default_factory=lambda: {
             "found": 0,
@@ -237,15 +245,34 @@ class Operation:
 
 OPERATIONS: dict[str, Operation] = {}
 OPERATIONS_LOCK = Lock()
+_last_cleanup: float = 0.0
+
+
+def _cleanup_expired_operations() -> None:
+    """Remove operations older than TTL. Must be called with lock held."""
+    global _last_cleanup
+    now = time.time()
+    # Only cleanup every 60 seconds to avoid overhead
+    if now - _last_cleanup < 60:
+        return
+    _last_cleanup = now
+    expired = [
+        op_id for op_id, op in OPERATIONS.items()
+        if op.status == "done" and (now - op.created_at) > OPERATION_TTL
+    ]
+    for op_id in expired:
+        del OPERATIONS[op_id]
 
 
 def store_operation(operation: Operation) -> None:
     with OPERATIONS_LOCK:
+        _cleanup_expired_operations()
         OPERATIONS[operation.operation_id] = operation
 
 
 def get_operation(operation_id: str) -> Operation | None:
     with OPERATIONS_LOCK:
+        _cleanup_expired_operations()
         return OPERATIONS.get(operation_id)
 
 
@@ -336,7 +363,17 @@ def _collect_results(
             for future in as_completed(futures):
                 zip_file = futures[future]
                 operation.current = str(zip_file)
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = {
+                        "path": zip_file,
+                        "success": False,
+                        "skipped": False,
+                        "message": f"Vynimka: {_sanitize_log_message(str(e))}",
+                        "files_count": 0,
+                        "total_size": 0,
+                    }
                 _apply_result(operation, result)
     else:
         for zip_file in zip_list:
