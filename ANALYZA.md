@@ -36,6 +36,10 @@ unzip/
 - Validácia: kontrola či adresár existuje
 - Bezpečnosť: kontrola prístupových práv
 
+### 1a. Nastavenia extrakcie
+- Politika konfliktu cieloveho priecinka: skip/overwrite/suffix
+- Volitelna paralelna extrakcia (max workerov z ENV)
+
 ### 2. Vyhľadanie ZIP súborov
 - Rekurzívne prehľadanie adresára (vrátane podadresárov)
 - Vyhľadanie všetkých súborov s príponou `.zip`

@@ -527,6 +527,11 @@ def get():
                     cls="checkbox-group"
                 ),
                 Div(
+                    Input(type="checkbox", name="parallel", id="parallel", checked=(MAX_WORKERS > 1)),
+                    Label(f" Paralelna extrakcia (max {MAX_WORKERS} workerov)", fr="parallel"),
+                    cls="checkbox-group"
+                ),
+                Div(
                     Label("Pri konflikte cieloveho priecinka:", fr="conflict_policy"),
                     Select(
                         Option("Preskocit", value="skip", selected=True),
@@ -544,15 +549,17 @@ def get():
                 ),
                 method="post"
             ),
+            P(f"Povoleny root: {BASE_DIR}" if not ALLOW_ANY_PATH else "Povoleny root: (neobmedzeny)"),
             cls="container"
         )
     )
 
 
 @rt("/extract")
-def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip"):
+def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
     """Spracuje extrakciu ZIP súborov."""
     is_recursive = recursive is not None
+    use_parallel = parallel is not None and MAX_WORKERS > 1
     path = Path(directory).expanduser().resolve()
 
     # Validácia adresára
@@ -615,7 +622,7 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
     def process_zip(zip_file: Path) -> dict:
         return extract_zip(zip_file, conflict_policy, log_path)
 
-    if MAX_WORKERS > 1:
+    if use_parallel:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             for result in executor.map(process_zip, zip_files):
                 results.append(result)
