@@ -121,6 +121,22 @@ Po dokončení zobraziť:
 1. **Path traversal** - validácia cesty, zabránenie prístupu mimo povolené adresáre
 2. **ZIP bomb** - limit na veľkosť extrahovaných dát
 3. **Symlink útoky** - kontrola symbolických odkazov v ZIP archívoch
+4. **Root limit** - spracovanie len pod urcenym base adresarom (UNZIP_BASE_DIR)
+5. **Konflikty** - politika pre existujuci cielovy priecinok (skip/overwrite/suffix)
+6. **Logovanie** - zapis operacii do `logs/` pre audit a diagnostiku
+
+---
+
+## Konfiguracia (ENV)
+
+- `UNZIP_BASE_DIR` - povoleny root adresar (default: domovsky adresar)
+- `UNZIP_ALLOW_ANY_PATH` - povoli akukolvek cestu (`1/true/yes`)
+- `UNZIP_LOG_DIR` - adresar pre logy (default: `logs`)
+- `UNZIP_MAX_TOTAL_SIZE` - max velkost po rozbaleni (bytes)
+- `UNZIP_MAX_FILES` - max pocet suborov v archive
+- `UNZIP_MAX_FILE_SIZE` - max velkost jedneho suboru (bytes)
+- `UNZIP_MAX_COMPRESSION_RATIO` - max kompresny pomer
+- `UNZIP_MAX_ZIP_SIZE` - max velkost ZIP suboru (bytes)
 
 ---
 

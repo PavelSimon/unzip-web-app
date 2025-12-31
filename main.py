@@ -4,9 +4,15 @@ Postavené na FastHTML frameworku
 """
 
 from fasthtml.common import *
-from pathlib import Path
-import zipfile
+from pathlib import Path, PurePosixPath
+from datetime import datetime
+import os
+import shutil
+import stat
 import subprocess
+import tempfile
+import uuid
+import zipfile
 
 app, rt = fast_app(
     hdrs=[
@@ -165,6 +171,76 @@ app, rt = fast_app(
     ]
 )
 
+BASE_DIR = Path(os.environ.get("UNZIP_BASE_DIR", str(Path.home()))).expanduser().resolve()
+ALLOW_ANY_PATH = os.environ.get("UNZIP_ALLOW_ANY_PATH", "").lower() in {"1", "true", "yes"}
+LOG_DIR = Path(os.environ.get("UNZIP_LOG_DIR", "logs")).expanduser().resolve()
+
+MAX_TOTAL_SIZE = int(os.environ.get("UNZIP_MAX_TOTAL_SIZE", str(1024 * 1024 * 1024)))  # 1GB
+MAX_FILES = int(os.environ.get("UNZIP_MAX_FILES", "10000"))
+MAX_FILE_SIZE = int(os.environ.get("UNZIP_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB
+MAX_COMPRESSION_RATIO = float(os.environ.get("UNZIP_MAX_COMPRESSION_RATIO", "200"))
+MAX_ZIP_SIZE = int(os.environ.get("UNZIP_MAX_ZIP_SIZE", str(2 * 1024 * 1024 * 1024)))  # 2GB
+
+
+def log_event(log_path: Path, message: str) -> None:
+    """Zapise udalost do logu operacie."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def normalize_member_path(member: str) -> PurePosixPath:
+    """Normalizuje cestu v ZIP archive."""
+    return PurePosixPath(member.replace("\\", "/"))
+
+
+def is_safe_member_path(member: str) -> bool:
+    """Overi, ze cesta v ZIP neobsahuje path traversal ani absolutne cesty."""
+    path = normalize_member_path(member)
+    if path.is_absolute():
+        return False
+    if ".." in path.parts:
+        return False
+    if ":" in path.parts[0] if path.parts else False:
+        return False
+    return True
+
+
+def is_symlink_info(info: zipfile.ZipInfo) -> bool:
+    """Deteguje symlink v ZIP archive (unix external_attr)."""
+    mode = (info.external_attr >> 16) & 0o170000
+    return stat.S_ISLNK(mode)
+
+
+def validate_base_dir(path: Path) -> tuple[bool, str]:
+    """Overi, ze cesta je v povolenom base dir."""
+    if ALLOW_ANY_PATH:
+        return True, ""
+    try:
+        path.resolve().relative_to(BASE_DIR)
+        return True, ""
+    except ValueError:
+        return False, f"Cesta musi byt pod povolenym rootom: {BASE_DIR}"
+
+
+def resolve_target_dir(extract_to: Path, policy: str) -> tuple[Path | None, str]:
+    """Urcuje cielovy adresar pri konflikte."""
+    if not extract_to.exists():
+        return extract_to, ""
+    if policy == "skip":
+        return None, "Cielovy priecinok uz existuje"
+    if policy == "overwrite":
+        return extract_to, ""
+    if policy == "suffix":
+        counter = 1
+        while True:
+            candidate = extract_to.parent / f"{extract_to.name} ({counter})"
+            if not candidate.exists():
+                return candidate, ""
+            counter += 1
+    return None, "Neznama politika konfliktu"
+
 
 def format_size(size_bytes: int) -> str:
     """Formátuje veľkosť v bajtoch na čitateľný formát."""
@@ -183,7 +259,7 @@ def find_zip_files(directory: Path, recursive: bool = True) -> list[Path]:
         return list(directory.glob("*.zip"))
 
 
-def extract_zip(zip_path: Path) -> dict:
+def extract_zip(zip_path: Path, conflict_policy: str, log_path: Path | None = None) -> dict:
     """
     Extrahuje ZIP súbor do priečinka s rovnakým názvom.
     Vráti slovník s výsledkom operácie.
@@ -191,6 +267,7 @@ def extract_zip(zip_path: Path) -> dict:
     result = {
         "path": zip_path,
         "success": False,
+        "skipped": False,
         "message": "",
         "files_count": 0,
         "total_size": 0
@@ -199,41 +276,96 @@ def extract_zip(zip_path: Path) -> dict:
     extract_to = zip_path.parent / zip_path.stem
 
     try:
+        zip_size = zip_path.stat().st_size
+        if zip_size > MAX_ZIP_SIZE:
+            result["message"] = "ZIP je prilis velky"
+            return result
+
+        target_dir, conflict_message = resolve_target_dir(extract_to, conflict_policy)
+        if target_dir is None:
+            result["skipped"] = True
+            result["message"] = conflict_message
+            return result
+
+        temp_dir = Path(tempfile.mkdtemp(prefix=f".{target_dir.name}.", dir=target_dir.parent))
+
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            # Kontrola na ZIP bomb (max 1GB po extrakcii)
-            total_size = sum(info.file_size for info in zf.infolist())
-            if total_size > 1024 * 1024 * 1024:  # 1GB limit
-                result["message"] = "Príliš veľký archív (>1GB)"
+            infos = zf.infolist()
+
+            if len(infos) > MAX_FILES:
+                result["message"] = "Prilis vela suborov v archive"
                 return result
 
-            # Kontrola na path traversal
-            for member in zf.namelist():
-                member_path = extract_to / member
-                try:
-                    member_path.resolve().relative_to(extract_to.resolve())
-                except ValueError:
-                    result["message"] = "Bezpečnostná chyba: path traversal"
+            total_size = 0
+            for info in infos:
+                if info.is_dir():
+                    continue
+                if is_symlink_info(info):
+                    result["message"] = "Bezpecnostna chyba: symlink v archive"
                     return result
+                if not is_safe_member_path(info.filename):
+                    result["message"] = "Bezpecnostna chyba: path traversal"
+                    return result
+                if info.file_size > MAX_FILE_SIZE:
+                    result["message"] = "Subor v archive je prilis velky"
+                    return result
+                ratio = info.file_size / max(info.compress_size, 1)
+                if ratio > MAX_COMPRESSION_RATIO:
+                    result["message"] = "Podozrivy kompresny pomer"
+                    return result
+                total_size += info.file_size
 
-            # Vytvorenie cieľového adresára
-            extract_to.mkdir(exist_ok=True)
+            if total_size > MAX_TOTAL_SIZE:
+                result["message"] = "Prilis velky archiv po rozbaleni"
+                return result
 
-            # Extrakcia
-            zf.extractall(extract_to)
+            free_space = shutil.disk_usage(target_dir.parent).free
+            if total_size > free_space:
+                result["message"] = "Nedostatok miesta na disku"
+                return result
+
+            for info in infos:
+                member_path = normalize_member_path(info.filename)
+                if info.is_dir():
+                    (temp_dir / Path(*member_path.parts)).mkdir(parents=True, exist_ok=True)
+                    continue
+                dest_path = temp_dir / Path(*member_path.parts)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, dest_path.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+            if target_dir.exists() and conflict_policy == "overwrite":
+                if target_dir.is_dir():
+                    shutil.rmtree(target_dir)
+                else:
+                    target_dir.unlink()
+
+            temp_dir.replace(target_dir)
 
             result["success"] = True
-            result["files_count"] = len(zf.namelist())
+            result["files_count"] = len([i for i in infos if not i.is_dir()])
             result["total_size"] = total_size
-            result["message"] = f"OK ({result['files_count']} súborov)"
+            result["message"] = f"OK ({result['files_count']} suborov)"
 
     except zipfile.BadZipFile:
-        result["message"] = "Poškodený ZIP súbor"
+        result["message"] = "Poskodeny ZIP subor"
     except PermissionError:
-        result["message"] = "Nedostatočné oprávnenia"
+        result["message"] = "Nedostatocne opravnenia"
     except OSError as e:
-        result["message"] = f"Chyba systému: {e.strerror}"
+        result["message"] = f"Chyba systemu: {e.strerror}"
     except Exception as e:
-        result["message"] = f"Neočakávaná chyba: {str(e)}"
+        result["message"] = f"Neocakavana chyba: {str(e)}"
+    finally:
+        if not result["success"]:
+            try:
+                if "temp_dir" in locals() and temp_dir.exists():
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+    if log_path is not None:
+        status = "OK" if result["success"] else "SKIP" if result["skipped"] else "ERROR"
+        log_event(log_path, f"{status}: {zip_path} - {result['message']}")
 
     return result
 
@@ -382,6 +514,17 @@ def get():
                     cls="checkbox-group"
                 ),
                 Div(
+                    Label("Pri konflikte cieloveho priecinka:", fr="conflict_policy"),
+                    Select(
+                        Option("Preskocit", value="skip", selected=True),
+                        Option("Prepisat", value="overwrite"),
+                        Option("Pridat suffix", value="suffix"),
+                        name="conflict_policy",
+                        id="conflict_policy"
+                    ),
+                    cls="form-group"
+                ),
+                Div(
                     Button("Extrahovať ZIP súbory", type="submit", formaction="/extract"),
                     Button("Vymazať extrahované ZIP súbory", type="submit", formaction="/cleanup", cls="btn-danger"),
                     cls="action-buttons"
@@ -394,8 +537,9 @@ def get():
 
 
 @rt("/extract")
-def post(directory: str, recursive: bool = False):
+def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip"):
     """Spracuje extrakciu ZIP súborov."""
+    is_recursive = recursive is not None
     path = Path(directory).expanduser().resolve()
 
     # Validácia adresára
@@ -417,8 +561,18 @@ def post(directory: str, recursive: bool = False):
             )
         )
 
+    is_allowed, message = validate_base_dir(path)
+    if not is_allowed:
+        return Titled("ZIP Extractor",
+            Div(
+                Div(message, cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container"
+            )
+        )
+
     # Vyhľadanie ZIP súborov
-    zip_files = find_zip_files(path, recursive)
+    zip_files = find_zip_files(path, is_recursive)
 
     if not zip_files:
         return Titled("ZIP Extractor",
@@ -429,24 +583,31 @@ def post(directory: str, recursive: bool = False):
             )
         )
 
+    operation_id = uuid.uuid4().hex[:8]
+    log_path = LOG_DIR / f"extract_{operation_id}.log"
+    log_event(log_path, f"Start extrakcie v {path}")
+
     # Extrakcia a zbieranie štatistík
     stats = {
         "found": len(zip_files),
         "success": 0,
         "failed": 0,
+        "skipped": 0,
         "total_files": 0,
         "total_size": 0
     }
     results = []
 
     for zip_file in zip_files:
-        result = extract_zip(zip_file)
+        result = extract_zip(zip_file, conflict_policy, log_path)
         results.append(result)
 
         if result["success"]:
             stats["success"] += 1
             stats["total_files"] += result["files_count"]
             stats["total_size"] += result["total_size"]
+        elif result["skipped"]:
+            stats["skipped"] += 1
         else:
             stats["failed"] += 1
 
@@ -457,6 +618,10 @@ def post(directory: str, recursive: bool = False):
         if r["success"]:
             result_items.append(
                 Div(f"✓ {relative_path} - {r['message']}", cls="result-item success")
+            )
+        elif r["skipped"]:
+            result_items.append(
+                Div(f"⚠ {relative_path} - {r['message']}", cls="result-item warning")
             )
         else:
             result_items.append(
@@ -483,6 +648,11 @@ def post(directory: str, recursive: bool = False):
                     cls="stat-item"
                 ),
                 Div(
+                    Div(str(stats["skipped"]), cls="stat-value"),
+                    Div("Preskocene", cls="stat-label"),
+                    cls="stat-item"
+                ),
+                Div(
                     Div(str(stats["total_files"]), cls="stat-value"),
                     Div("Extrahovaných súborov", cls="stat-label"),
                     cls="stat-item"
@@ -490,6 +660,8 @@ def post(directory: str, recursive: bool = False):
                 cls="stats-grid"
             ),
             P(f"Celková veľkosť extrahovaných dát: {format_size(stats['total_size'])}"),
+            P(f"ID operacie: {operation_id}"),
+            P(f"Log: {log_path}"),
             cls="stats"
         ),
         Div(
@@ -503,8 +675,9 @@ def post(directory: str, recursive: bool = False):
 
 
 @rt("/cleanup")
-def post(directory: str, recursive: bool = False):
+def post(directory: str, recursive: str | None = None):
     """Vymaže ZIP súbory, ktoré boli úspešne extrahované."""
+    is_recursive = recursive is not None
     path = Path(directory).expanduser().resolve()
 
     # Validácia adresára
@@ -526,8 +699,18 @@ def post(directory: str, recursive: bool = False):
             )
         )
 
+    is_allowed, message = validate_base_dir(path)
+    if not is_allowed:
+        return Titled("ZIP Extractor",
+            Div(
+                Div(message, cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container"
+            )
+        )
+
     # Vyhľadanie ZIP súborov
-    zip_files = find_zip_files(path, recursive)
+    zip_files = find_zip_files(path, is_recursive)
 
     if not zip_files:
         return Titled("ZIP Extractor",
@@ -537,6 +720,10 @@ def post(directory: str, recursive: bool = False):
                 cls="container"
             )
         )
+
+    operation_id = uuid.uuid4().hex[:8]
+    log_path = LOG_DIR / f"cleanup_{operation_id}.log"
+    log_event(log_path, f"Start cistenia v {path}")
 
     # Kontrola a mazanie
     stats = {
@@ -565,6 +752,7 @@ def post(directory: str, recursive: bool = False):
                     "status": "deleted",
                     "message": f"Vymazaný (uvoľnené {format_size(delete_result['freed_size'])})"
                 })
+                log_event(log_path, f"OK: {zip_file} - deleted")
             else:
                 stats["failed"] += 1
                 results.append({
@@ -572,6 +760,7 @@ def post(directory: str, recursive: bool = False):
                     "status": "error",
                     "message": f"Chyba mazania: {delete_result['message']}"
                 })
+                log_event(log_path, f"ERROR: {zip_file} - {delete_result['message']}")
         else:
             stats["skipped"] += 1
             results.append({
@@ -579,6 +768,7 @@ def post(directory: str, recursive: bool = False):
                 "status": "skipped",
                 "message": f"Preskočený: {check_result['message']}"
             })
+            log_event(log_path, f"SKIP: {zip_file} - {check_result['message']}")
 
     # Vytvorenie výstupu
     result_items = []
@@ -624,6 +814,8 @@ def post(directory: str, recursive: bool = False):
                 cls="stats-grid"
             ),
             P(f"Uvoľnené miesto: {format_size(stats['freed_size'])}"),
+            P(f"ID operacie: {operation_id}"),
+            P(f"Log: {log_path}"),
             cls="stats"
         ),
         Div(
