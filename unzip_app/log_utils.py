@@ -3,6 +3,8 @@ from pathlib import Path
 
 from .config import LOG_DIR
 
+__all__ = ["log_event"]
+
 
 def log_event(log_path: Path, message: str) -> None:
     """Write a single log line for an operation."""

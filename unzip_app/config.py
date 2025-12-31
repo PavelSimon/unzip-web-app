@@ -1,6 +1,18 @@
 from pathlib import Path
 import os
 
+__all__ = [
+    "ALLOW_ANY_PATH",
+    "BASE_DIR",
+    "LOG_DIR",
+    "MAX_COMPRESSION_RATIO",
+    "MAX_FILES",
+    "MAX_FILE_SIZE",
+    "MAX_TOTAL_SIZE",
+    "MAX_WORKERS",
+    "MAX_ZIP_SIZE",
+]
+
 BASE_DIR = Path(os.environ.get("UNZIP_BASE_DIR", str(Path.home()))).expanduser().resolve()
 ALLOW_ANY_PATH = os.environ.get("UNZIP_ALLOW_ANY_PATH", "").lower() in {"1", "true", "yes"}
 LOG_DIR = Path(os.environ.get("UNZIP_LOG_DIR", "logs")).expanduser().resolve()

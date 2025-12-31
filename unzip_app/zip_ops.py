@@ -1,4 +1,5 @@
 from pathlib import Path, PurePosixPath
+from typing import Iterable
 import os
 import shutil
 import stat
@@ -15,6 +16,18 @@ from .config import (
     MAX_ZIP_SIZE,
 )
 from .log_utils import log_event
+
+__all__ = [
+    "delete_zip_file",
+    "extract_zip",
+    "find_zip_files",
+    "is_safe_member_path",
+    "is_symlink_info",
+    "is_zip_extracted",
+    "normalize_member_path",
+    "resolve_target_dir",
+    "validate_base_dir",
+]
 
 
 def normalize_member_path(member: str) -> PurePosixPath:
@@ -69,7 +82,7 @@ def resolve_target_dir(extract_to: Path, policy: str) -> tuple[Path | None, str]
     return None, "Neznama politika konfliktu"
 
 
-def find_zip_files(directory: Path, recursive: bool = True):
+def find_zip_files(directory: Path, recursive: bool = True) -> Iterable[Path]:
     """Yield zip files in the given directory."""
     if recursive:
         for root, _, files in os.walk(directory, onerror=lambda _: None):
@@ -85,7 +98,7 @@ def find_zip_files(directory: Path, recursive: bool = True):
             return
 
 
-def extract_zip(zip_path: Path, conflict_policy: str, log_path: Path | None = None) -> dict:
+def extract_zip(zip_path: Path, conflict_policy: str, log_path: Path | None = None) -> dict[str, object]:
     """Extract a zip file into a sibling directory."""
     result = {
         "path": zip_path,
@@ -193,7 +206,7 @@ def extract_zip(zip_path: Path, conflict_policy: str, log_path: Path | None = No
     return result
 
 
-def is_zip_extracted(zip_path: Path) -> dict:
+def is_zip_extracted(zip_path: Path) -> dict[str, object]:
     """Check whether the zip file has been fully extracted."""
     result = {
         "path": zip_path,
@@ -245,7 +258,7 @@ def is_zip_extracted(zip_path: Path) -> dict:
     return result
 
 
-def delete_zip_file(zip_path: Path) -> dict:
+def delete_zip_file(zip_path: Path) -> dict[str, object]:
     """Delete a zip file after verification."""
     result = {
         "path": zip_path,
