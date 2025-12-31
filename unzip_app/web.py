@@ -710,19 +710,16 @@ def get(operation_id: str):
 
     if operation.status == "error":
         return Div(
+            Div(operation.message or "Neocakavana chyba.", cls="error-message"),
             id=f"operation-{operation_id}",
-            children=Div(operation.message or "Neocakavana chyba.", cls="error-message"),
         )
 
     if operation.status == "done":
-        return Div(
-            id=f"operation-{operation_id}",
-            children=render_results(operation),
-        )
+        return Div(render_results(operation), id=f"operation-{operation_id}")
 
     return Div(
+        render_progress(operation),
         id=f"operation-{operation_id}",
-        children=render_progress(operation),
         hx_get=f"/status/{operation_id}",
         hx_trigger="load, every 1s",
         hx_swap="outerHTML",
