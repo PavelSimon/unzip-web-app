@@ -31,6 +31,7 @@ Otvor `http://localhost:5001` (default FastHTML).
 - Zadaj cestu k adresaru.
 - Zvol politiku konfliktu cieloveho priecinka: skip/overwrite/suffix.
 - Volitelne zapni paralelnu extrakciu.
+- Po spusteni extrakcie sa zobrazi priebeh a stranka sa automaticky aktualizuje.
 - Spusti extrakciu alebo cistenie ZIP suborov.
 
 ## Struktura projektu

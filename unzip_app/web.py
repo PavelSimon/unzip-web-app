@@ -2,7 +2,10 @@
 
 from fasthtml.common import *
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from threading import Lock, Thread
+from typing import Iterable
 import itertools
 import subprocess
 import uuid
@@ -172,9 +175,70 @@ app, rt = fast_app(
             .result-item.warning {
                 color: #856404;
             }
+            .progress {
+                background: #e9ecef;
+                border-radius: 6px;
+                overflow: hidden;
+                height: 12px;
+                margin: 10px 0;
+            }
+            .progress-bar {
+                background: #007bff;
+                height: 100%;
+                transition: width 0.3s ease;
+            }
+            .progress-bar.indeterminate {
+                width: 100%;
+                background: linear-gradient(90deg, #007bff 0%, #8cc0ff 50%, #007bff 100%);
+                background-size: 200% 100%;
+                animation: progress-move 1.2s linear infinite;
+            }
+            @keyframes progress-move {
+                from { background-position: 0% 0; }
+                to { background-position: 200% 0; }
+            }
         """)
     ]
 )
+
+@dataclass
+class Operation:
+    """Track the state of a background extraction operation."""
+    operation_id: str
+    path: Path
+    conflict_policy: str
+    recursive: bool
+    parallel: bool
+    log_path: Path
+    stats: dict[str, int] = field(
+        default_factory=lambda: {
+            "found": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total_files": 0,
+            "total_size": 0,
+        }
+    )
+    results: list[dict[str, object]] = field(default_factory=list)
+    status: str = "running"
+    message: str = ""
+    total: int | None = None
+    current: str = ""
+
+
+OPERATIONS: dict[str, Operation] = {}
+OPERATIONS_LOCK = Lock()
+
+
+def store_operation(operation: Operation) -> None:
+    with OPERATIONS_LOCK:
+        OPERATIONS[operation.operation_id] = operation
+
+
+def get_operation(operation_id: str) -> Operation | None:
+    with OPERATIONS_LOCK:
+        return OPERATIONS.get(operation_id)
 
 
 def format_size(size_bytes: int) -> str:
@@ -200,6 +264,158 @@ def open_directory_dialog() -> str:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return ""
+
+
+def _apply_result(operation: Operation, result: dict[str, object]) -> None:
+    operation.results.append(result)
+    operation.stats["found"] += 1
+    if result["success"]:
+        operation.stats["success"] += 1
+        operation.stats["total_files"] += int(result["files_count"])
+        operation.stats["total_size"] += int(result["total_size"])
+    elif result["skipped"]:
+        operation.stats["skipped"] += 1
+    else:
+        operation.stats["failed"] += 1
+
+
+def _collect_results(
+    operation: Operation,
+    zip_files: Iterable[Path],
+    process_zip,
+    use_parallel: bool,
+) -> None:
+    if use_parallel:
+        zip_list = list(zip_files)
+        operation.total = len(zip_list)
+        if not zip_list:
+            operation.message = "V zadanom adresári sa nenašli žiadne ZIP súbory."
+            operation.status = "done"
+            return
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_list}
+            for future in as_completed(futures):
+                zip_file = futures[future]
+                operation.current = str(zip_file)
+                result = future.result()
+                _apply_result(operation, result)
+    else:
+        found_any = False
+        for zip_file in zip_files:
+            found_any = True
+            operation.current = str(zip_file)
+            result = process_zip(zip_file)
+            _apply_result(operation, result)
+        if not found_any:
+            operation.message = "V zadanom adresári sa nenašli žiadne ZIP súbory."
+            operation.status = "done"
+
+
+def run_extraction(operation_id: str) -> None:
+    operation = get_operation(operation_id)
+    if operation is None:
+        return
+    try:
+        log_event(operation.log_path, f"Start extrakcie v {operation.path}")
+
+        def process_zip(zip_file: Path) -> dict:
+            return extract_zip(zip_file, operation.conflict_policy, operation.log_path)
+
+        zip_files = find_zip_files(operation.path, operation.recursive)
+        use_parallel = operation.parallel and MAX_WORKERS > 1
+        _collect_results(operation, zip_files, process_zip, use_parallel)
+        if operation.status != "done":
+            operation.status = "done"
+    except Exception as exc:
+        operation.status = "error"
+        operation.message = f"Neocakavana chyba: {exc}"
+
+
+def _result_items(operation: Operation) -> list:
+    result_items = []
+    for result in operation.results:
+        relative_path = (
+            result["path"].relative_to(operation.path)
+            if result["path"].is_relative_to(operation.path)
+            else result["path"]
+        )
+        if result["success"]:
+            result_items.append(Div(f"✓ {relative_path} - {result['message']}", cls="result-item success"))
+        elif result["skipped"]:
+            result_items.append(Div(f"⚠ {relative_path} - {result['message']}", cls="result-item warning"))
+        else:
+            result_items.append(Div(f"✗ {relative_path} - {result['message']}", cls="result-item error"))
+    return result_items
+
+
+def render_progress(operation: Operation) -> object:
+    total = operation.total
+    processed = operation.stats["found"]
+    if total:
+        percent = min(100, int((processed / total) * 100))
+        progress_bar = Div(cls="progress", children=Div(cls="progress-bar", style=f"width: {percent}%"))
+        progress_label = P(f"Spracované: {processed}/{total} ({percent}%)")
+    else:
+        progress_bar = Div(cls="progress", children=Div(cls="progress-bar indeterminate"))
+        progress_label = P(f"Spracované: {processed}")
+
+    current = P(f"Aktuálne: {Path(operation.current).name}") if operation.current else ""
+
+    return Div(
+        H2("Prebieha extrakcia"),
+        progress_bar,
+        progress_label,
+        current,
+        Div(
+            Div(Div(str(operation.stats["success"]), cls="stat-value"), Div("Úspešne", cls="stat-label"), cls="stat-item"),
+            Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+            Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
+            Div(
+                Div(str(operation.stats["total_files"]), cls="stat-value"),
+                Div("Extrahovaných súborov", cls="stat-label"),
+                cls="stat-item",
+            ),
+            cls="stats-grid",
+        ),
+        P(f"Celková veľkosť extrahovaných dát: {format_size(operation.stats['total_size'])}"),
+        P(f"ID operácie: {operation.operation_id}"),
+        P(f"Log: {operation.log_path}"),
+        cls="stats",
+    )
+
+
+def render_results(operation: Operation) -> object:
+    if operation.message:
+        return Div(Div(operation.message, cls="info-message"), A("← Späť", href="/", cls="back-link"))
+
+    result_items = _result_items(operation)
+    return Div(
+        Div(
+            H2("Štatistika"),
+            Div(
+                Div(Div(str(operation.stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
+                Div(
+                    Div(str(operation.stats["success"]), cls="stat-value"),
+                    Div("Úspešne extrahovaných", cls="stat-label"),
+                    cls="stat-item",
+                ),
+                Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+                Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
+                Div(
+                    Div(str(operation.stats["total_files"]), cls="stat-value"),
+                    Div("Extrahovaných súborov", cls="stat-label"),
+                    cls="stat-item",
+                ),
+                cls="stats-grid",
+            ),
+            P(f"Celková veľkosť extrahovaných dát: {format_size(operation.stats['total_size'])}"),
+            P(f"ID operácie: {operation.operation_id}"),
+            P(f"Log: {operation.log_path}"),
+            cls="stats",
+        ),
+        Div(H3("Detail operácií"), *result_items, cls="results"),
+        A("← Nová extrakcia", href="/", cls="back-link"),
+    )
 
 
 @rt("/browse")
@@ -323,101 +539,62 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
             ),
         )
 
-    zip_files = find_zip_files(path, is_recursive)
-    first_zip = next(zip_files, None)
-    if first_zip is None:
-        return Titled(
-            "ZIP Extractor",
-            Div(
-                Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
-                A("← Späť", href="/", cls="back-link"),
-                cls="container",
-            ),
-        )
-    zip_files = itertools.chain([first_zip], zip_files)
-
     operation_id = uuid.uuid4().hex[:8]
     log_path = LOG_DIR / f"extract_{operation_id}.log"
-    log_event(log_path, f"Start extrakcie v {path}")
-
-    stats = {
-        "found": 0,
-        "success": 0,
-        "failed": 0,
-        "skipped": 0,
-        "total_files": 0,
-        "total_size": 0,
-    }
-    results = []
-
-    def process_zip(zip_file: Path) -> dict:
-        return extract_zip(zip_file, conflict_policy, log_path)
-
-    if use_parallel:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for result in executor.map(process_zip, zip_files):
-                results.append(result)
-                stats["found"] += 1
-                if result["success"]:
-                    stats["success"] += 1
-                    stats["total_files"] += result["files_count"]
-                    stats["total_size"] += result["total_size"]
-                elif result["skipped"]:
-                    stats["skipped"] += 1
-                else:
-                    stats["failed"] += 1
-    else:
-        for zip_file in zip_files:
-            result = process_zip(zip_file)
-            results.append(result)
-            stats["found"] += 1
-            if result["success"]:
-                stats["success"] += 1
-                stats["total_files"] += result["files_count"]
-                stats["total_size"] += result["total_size"]
-            elif result["skipped"]:
-                stats["skipped"] += 1
-            else:
-                stats["failed"] += 1
-
-    result_items = []
-    for r in results:
-        relative_path = r["path"].relative_to(path) if r["path"].is_relative_to(path) else r["path"]
-        if r["success"]:
-            result_items.append(Div(f"✓ {relative_path} - {r['message']}", cls="result-item success"))
-        elif r["skipped"]:
-            result_items.append(Div(f"⚠ {relative_path} - {r['message']}", cls="result-item warning"))
-        else:
-            result_items.append(Div(f"✗ {relative_path} - {r['message']}", cls="result-item error"))
+    operation = Operation(
+        operation_id=operation_id,
+        path=path,
+        conflict_policy=conflict_policy,
+        recursive=is_recursive,
+        parallel=use_parallel,
+        log_path=log_path,
+    )
+    store_operation(operation)
+    Thread(target=run_extraction, args=(operation_id,), daemon=True).start()
 
     return Titled(
-        "ZIP Extractor - Výsledky",
+        "ZIP Extractor - Priebeh",
         Div(
-            H2("Štatistika"),
             Div(
-                Div(Div(str(stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
-                Div(
-                    Div(str(stats["success"]), cls="stat-value"),
-                    Div("Úspešne extrahovaných", cls="stat-label"),
-                    cls="stat-item",
-                ),
-                Div(Div(str(stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
-                Div(Div(str(stats["skipped"]), cls="stat-value"), Div("Preskocene", cls="stat-label"), cls="stat-item"),
-                Div(
-                    Div(str(stats["total_files"]), cls="stat-value"),
-                    Div("Extrahovaných súborov", cls="stat-label"),
-                    cls="stat-item",
-                ),
-                cls="stats-grid",
+                "Extrakcia beží na pozadí. Stránka sa bude automaticky aktualizovať.",
+                cls="info-message",
             ),
-            P(f"Celková veľkosť extrahovaných dát: {format_size(stats['total_size'])}"),
-            P(f"ID operacie: {operation_id}"),
-            P(f"Log: {log_path}"),
-            cls="stats",
+            Div(
+                id=f"operation-{operation_id}",
+                hx_get=f"/status/{operation_id}",
+                hx_trigger="load, every 1s",
+                hx_swap="outerHTML",
+            ),
+            cls="container",
         ),
-        Div(H3("Detail operácií"), *result_items, cls="results"),
-        A("← Nová extrakcia", href="/", cls="back-link"),
-        cls="container",
+    )
+
+
+@rt("/status/{operation_id}")
+def get(operation_id: str):
+    """Return progress or results for a background extraction."""
+    operation = get_operation(operation_id)
+    if operation is None:
+        return Div(Div("Operácia neexistuje alebo expirovala.", cls="error-message"))
+
+    if operation.status == "error":
+        return Div(
+            id=f"operation-{operation_id}",
+            children=Div(operation.message or "Neocakavana chyba.", cls="error-message"),
+        )
+
+    if operation.status == "done":
+        return Div(
+            id=f"operation-{operation_id}",
+            children=render_results(operation),
+        )
+
+    return Div(
+        id=f"operation-{operation_id}",
+        children=render_progress(operation),
+        hx_get=f"/status/{operation_id}",
+        hx_trigger="load, every 1s",
+        hx_swap="outerHTML",
     )
 
 
