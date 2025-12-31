@@ -7,9 +7,11 @@ Web aplikacia na hromadnu extrakciu ZIP suborov v zadanom adresari.
 - python-fasthtml
 - (volitelne) `yad` pre GUI vyber adresara
 
-## Spustenie
+## Spustenie (uv)
 ```bash
-python main.py
+uv venv .venv
+uv pip install -r requirements.txt
+uv run python main.py
 ```
 
 Otvor `http://localhost:5001` (default FastHTML).
