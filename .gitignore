@@ -1,5 +1,6 @@
 __pycache__/
 .venv/
 test_data/
+logs/
 .sesskey
 *.pyc
