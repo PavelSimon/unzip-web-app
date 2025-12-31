@@ -204,11 +204,11 @@ def generate_csrf_token():
 3. ✅ Validácia konfigurácie na štarte - `config.py`: `_validate_config()` funkcia
 4. ✅ Log sanitization - `log_utils.py`: `sanitize_log_message()` funkcia
 
-### Fáza 2: Bezpečnostné vylepšenia
-5. CSRF ochrana
-6. Rate limiting
-7. Autentifikácia (ak je potrebná)
-8. Security headers (CSP, X-Frame-Options)
+### Fáza 2: Bezpečnostné vylepšenia ✅ IMPLEMENTOVANÉ
+5. ✅ CSRF ochrana - `security.py`: HMAC-based tokens s časovým obmedzením
+6. ✅ Rate limiting - `security.py`: sliding window rate limiter (60 req/min default)
+7. ✅ HTTP Basic Auth - `security.py`: voliteľná autentifikácia (UNZIP_AUTH_ENABLED)
+8. ✅ Security headers - `security.py`: CSP, X-Frame-Options, X-Content-Type-Options, etc.
 
 ### Fáza 3: Stabilita a UX
 9. Operation cancellation

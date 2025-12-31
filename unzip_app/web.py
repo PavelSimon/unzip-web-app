@@ -14,6 +14,14 @@ from starlette.responses import FileResponse
 
 from .config import ALLOW_ANY_PATH, BASE_DIR, LOG_DIR, MAX_WORKERS
 from .log_utils import log_event, sanitize_log_message
+from .security import (
+    BasicAuthMiddleware,
+    RateLimitMiddleware,
+    SecurityHeadersMiddleware,
+    csrf_input,
+    generate_csrf_token,
+    validate_csrf_token,
+)
 from .zip_ops import (
     delete_zip_file,
     extract_zip,
@@ -206,10 +214,27 @@ app, rt = fast_app(
     ]
 )
 
+# Add security middleware (order matters: first added = last executed)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(BasicAuthMiddleware)
+
 OPERATION_TTL = 3600  # 1 hour - operations older than this are cleaned up
 
 # Alias for use in exception handlers
 _sanitize_log_message = sanitize_log_message
+
+
+def _csrf_error_response() -> object:
+    """Return error response for invalid CSRF token."""
+    return Titled(
+        "ZIP Extractor",
+        Div(
+            Div("Neplatný bezpečnostný token. Obnovte stránku a skúste znova.", cls="error-message"),
+            A("← Späť", href="/", cls="back-link"),
+            cls="container",
+        ),
+    )
 
 
 @dataclass
@@ -547,6 +572,7 @@ def get():
         Div(
             P("Zadajte cestu k adresáru, v ktorom chcete extrahovať všetky ZIP súbory."),
             Form(
+                Input(type="hidden", name="csrf_token", value=generate_csrf_token()),
                 Div(
                     Label("Cesta k adresáru:", fr="directory"),
                     Div(
@@ -657,8 +683,11 @@ def start_extraction_response(
 
 
 @rt("/extract")
-def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
+def post(directory: str, csrf_token: str = "", recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
     """Handle ZIP extraction."""
+    if not validate_csrf_token(csrf_token):
+        return _csrf_error_response()
+
     is_recursive = recursive is not None
     use_parallel = parallel is not None and MAX_WORKERS > 1
     path = Path(directory).expanduser().resolve()
@@ -698,8 +727,11 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
 
 
 @rt("/extract-delete")
-def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
+def post(directory: str, csrf_token: str = "", recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
     """Handle ZIP extraction and delete the zip afterwards."""
+    if not validate_csrf_token(csrf_token):
+        return _csrf_error_response()
+
     is_recursive = recursive is not None
     use_parallel = parallel is not None and MAX_WORKERS > 1
     path = Path(directory).expanduser().resolve()
@@ -764,8 +796,11 @@ def get(operation_id: str):
 
 
 @rt("/cleanup")
-def post(directory: str, recursive: str | None = None):
+def post(directory: str, csrf_token: str = "", recursive: str | None = None):
     """Delete ZIP files that were extracted successfully."""
+    if not validate_csrf_token(csrf_token):
+        return _csrf_error_response()
+
     is_recursive = recursive is not None
     path = Path(directory).expanduser().resolve()
 
