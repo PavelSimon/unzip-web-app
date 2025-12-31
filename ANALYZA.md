@@ -22,9 +22,14 @@ Web aplikácia postavená na **FastHTML** frameworku, ktorá umožňuje použív
 
 ```
 unzip/
-├── main.py          # Hlavná aplikácia FastHTML
-├── ANALYZA.md       # Tento súbor
-└── requirements.txt # Závislosti
+├── main.py               # Minimalny entrypoint
+├── unzip_app/            # Logika aplikacie
+│   ├── config.py         # Konfiguracia a limity
+│   ├── log_utils.py      # Logovanie
+│   ├── zip_ops.py        # Operacie so ZIP
+│   └── web.py            # UI a routes
+├── ANALYZA.md            # Tento súbor
+└── requirements.txt      # Závislosti
 ```
 
 ---

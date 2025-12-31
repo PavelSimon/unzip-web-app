@@ -33,6 +33,13 @@ Otvor `http://localhost:5001` (default FastHTML).
 - Volitelne zapni paralelnu extrakciu.
 - Spusti extrakciu alebo cistenie ZIP suborov.
 
+## Struktura projektu
+- `main.py` - minimalny entrypoint
+- `unzip_app/config.py` - konfiguracia a limity
+- `unzip_app/log_utils.py` - logovanie operacii
+- `unzip_app/zip_ops.py` - vykonne operacie so ZIP subormi
+- `unzip_app/web.py` - UI a HTTP routes
+
 ## Konfiguracia (ENV)
 - `UNZIP_BASE_DIR` - povoleny root adresar (default: domovsky adresar)
 - `UNZIP_ALLOW_ANY_PATH` - povoli akukolvek cestu (`1/true/yes`)

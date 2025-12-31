@@ -1,0 +1,554 @@
+"""Web routes and UI for ZIP Extractor."""
+
+from fasthtml.common import *
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import itertools
+import subprocess
+import uuid
+
+from .config import ALLOW_ANY_PATH, BASE_DIR, LOG_DIR, MAX_WORKERS
+from .log_utils import log_event
+from .zip_ops import (
+    delete_zip_file,
+    extract_zip,
+    find_zip_files,
+    is_zip_extracted,
+    validate_base_dir,
+)
+
+app, rt = fast_app(
+    hdrs=[
+        Style("""
+            body {
+                font-family: system-ui, -apple-system, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                border-bottom: 2px solid #007bff;
+                padding-bottom: 10px;
+            }
+            .form-group {
+                margin-bottom: 20px;
+            }
+            input[type="text"] {
+                width: 100%;
+                padding: 12px;
+                border: 2px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+                box-sizing: border-box;
+            }
+            input[type="text"]:focus {
+                border-color: #007bff;
+                outline: none;
+            }
+            .checkbox-group {
+                margin: 15px 0;
+            }
+            .checkbox-group label {
+                cursor: pointer;
+            }
+            button {
+                background: #007bff;
+                color: white;
+                padding: 12px 30px;
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                cursor: pointer;
+                width: 100%;
+            }
+            button:hover {
+                background: #0056b3;
+            }
+            .stats {
+                background: #e8f4fd;
+                padding: 20px;
+                border-radius: 8px;
+                margin-top: 20px;
+            }
+            .stats h2 {
+                margin-top: 0;
+                color: #0056b3;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+            }
+            .stat-item {
+                background: white;
+                padding: 15px;
+                border-radius: 5px;
+                text-align: center;
+            }
+            .stat-value {
+                font-size: 24px;
+                font-weight: bold;
+                color: #007bff;
+            }
+            .stat-label {
+                color: #666;
+                font-size: 14px;
+            }
+            .results {
+                margin-top: 20px;
+            }
+            .result-item {
+                padding: 10px;
+                border-bottom: 1px solid #eee;
+                font-family: monospace;
+            }
+            .result-item.success {
+                color: #28a745;
+            }
+            .result-item.error {
+                color: #dc3545;
+            }
+            .error-message {
+                background: #f8d7da;
+                color: #721c24;
+                padding: 15px;
+                border-radius: 5px;
+                margin-top: 20px;
+            }
+            .info-message {
+                background: #fff3cd;
+                color: #856404;
+                padding: 15px;
+                border-radius: 5px;
+                margin-top: 20px;
+            }
+            .back-link {
+                display: inline-block;
+                margin-top: 20px;
+                color: #007bff;
+                text-decoration: none;
+            }
+            .back-link:hover {
+                text-decoration: underline;
+            }
+            .input-group {
+                display: flex;
+                gap: 10px;
+            }
+            .input-group input[type="text"] {
+                flex: 1;
+            }
+            .btn-browse {
+                background: #6c757d;
+                white-space: nowrap;
+                width: auto;
+                padding: 12px 20px;
+            }
+            .btn-browse:hover {
+                background: #5a6268;
+            }
+            .btn-danger {
+                background: #dc3545;
+                margin-top: 10px;
+            }
+            .btn-danger:hover {
+                background: #c82333;
+            }
+            .action-buttons {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            .result-item.warning {
+                color: #856404;
+            }
+        """)
+    ]
+)
+
+
+def format_size(size_bytes: int) -> str:
+    """Format size in bytes to a human readable string."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+def open_directory_dialog() -> str:
+    """Open GUI dialog for directory selection using yad."""
+    try:
+        result = subprocess.run(
+            ["yad", "--file", "--directory", "--title=Vybrať adresár"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return ""
+
+
+@rt("/browse")
+def get():
+    """Open GUI dialog and return selected path."""
+    path = open_directory_dialog()
+    return Input(
+        type="text",
+        name="directory",
+        id="directory",
+        value=path,
+        placeholder="/cesta/k/adresaru",
+        required=True,
+    )
+
+
+@rt("/")
+def get():
+    """Main page with the form."""
+    return Titled(
+        "ZIP Extractor",
+        Div(
+            P("Zadajte cestu k adresáru, v ktorom chcete extrahovať všetky ZIP súbory."),
+            Form(
+                Div(
+                    Label("Cesta k adresáru:", fr="directory"),
+                    Div(
+                        Input(
+                            type="text",
+                            name="directory",
+                            id="directory",
+                            placeholder="/cesta/k/adresaru",
+                            required=True,
+                        ),
+                        Button(
+                            "Prehľadávať...",
+                            type="button",
+                            cls="btn-browse",
+                            hx_get="/browse",
+                            hx_target="#directory",
+                            hx_swap="outerHTML",
+                        ),
+                        cls="input-group",
+                    ),
+                    cls="form-group",
+                ),
+                Div(
+                    Input(type="checkbox", name="recursive", id="recursive", checked=True),
+                    Label(" Rekurzívne (vrátane podadresárov)", fr="recursive"),
+                    cls="checkbox-group",
+                ),
+                Div(
+                    Input(type="checkbox", name="parallel", id="parallel", checked=(MAX_WORKERS > 1)),
+                    Label(f" Paralelna extrakcia (max {MAX_WORKERS} workerov)", fr="parallel"),
+                    cls="checkbox-group",
+                ),
+                Div(
+                    Label("Pri konflikte cieloveho priecinka:", fr="conflict_policy"),
+                    Select(
+                        Option("Preskocit", value="skip", selected=True),
+                        Option("Prepisat", value="overwrite"),
+                        Option("Pridat suffix", value="suffix"),
+                        name="conflict_policy",
+                        id="conflict_policy",
+                    ),
+                    cls="form-group",
+                ),
+                Div(
+                    Button("Extrahovať ZIP súbory", type="submit", formaction="/extract"),
+                    Button(
+                        "Vymazať extrahované ZIP súbory",
+                        type="submit",
+                        formaction="/cleanup",
+                        cls="btn-danger",
+                    ),
+                    cls="action-buttons",
+                ),
+                method="post",
+            ),
+            P(f"Povoleny root: {BASE_DIR}" if not ALLOW_ANY_PATH else "Povoleny root: (neobmedzeny)"),
+            cls="container",
+        ),
+    )
+
+
+@rt("/extract")
+def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
+    """Handle ZIP extraction."""
+    is_recursive = recursive is not None
+    use_parallel = parallel is not None and MAX_WORKERS > 1
+    path = Path(directory).expanduser().resolve()
+
+    if not path.exists():
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(f"Adresár '{directory}' neexistuje!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    if not path.is_dir():
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(f"'{directory}' nie je adresár!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    is_allowed, message = validate_base_dir(path)
+    if not is_allowed:
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(message, cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    zip_files = find_zip_files(path, is_recursive)
+    first_zip = next(zip_files, None)
+    if first_zip is None:
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+    zip_files = itertools.chain([first_zip], zip_files)
+
+    operation_id = uuid.uuid4().hex[:8]
+    log_path = LOG_DIR / f"extract_{operation_id}.log"
+    log_event(log_path, f"Start extrakcie v {path}")
+
+    stats = {
+        "found": 0,
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+        "total_files": 0,
+        "total_size": 0,
+    }
+    results = []
+
+    def process_zip(zip_file: Path) -> dict:
+        return extract_zip(zip_file, conflict_policy, log_path)
+
+    if use_parallel:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for result in executor.map(process_zip, zip_files):
+                results.append(result)
+                stats["found"] += 1
+                if result["success"]:
+                    stats["success"] += 1
+                    stats["total_files"] += result["files_count"]
+                    stats["total_size"] += result["total_size"]
+                elif result["skipped"]:
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+    else:
+        for zip_file in zip_files:
+            result = process_zip(zip_file)
+            results.append(result)
+            stats["found"] += 1
+            if result["success"]:
+                stats["success"] += 1
+                stats["total_files"] += result["files_count"]
+                stats["total_size"] += result["total_size"]
+            elif result["skipped"]:
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
+
+    result_items = []
+    for r in results:
+        relative_path = r["path"].relative_to(path) if r["path"].is_relative_to(path) else r["path"]
+        if r["success"]:
+            result_items.append(Div(f"✓ {relative_path} - {r['message']}", cls="result-item success"))
+        elif r["skipped"]:
+            result_items.append(Div(f"⚠ {relative_path} - {r['message']}", cls="result-item warning"))
+        else:
+            result_items.append(Div(f"✗ {relative_path} - {r['message']}", cls="result-item error"))
+
+    return Titled(
+        "ZIP Extractor - Výsledky",
+        Div(
+            H2("Štatistika"),
+            Div(
+                Div(Div(str(stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
+                Div(
+                    Div(str(stats["success"]), cls="stat-value"),
+                    Div("Úspešne extrahovaných", cls="stat-label"),
+                    cls="stat-item",
+                ),
+                Div(Div(str(stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+                Div(Div(str(stats["skipped"]), cls="stat-value"), Div("Preskocene", cls="stat-label"), cls="stat-item"),
+                Div(
+                    Div(str(stats["total_files"]), cls="stat-value"),
+                    Div("Extrahovaných súborov", cls="stat-label"),
+                    cls="stat-item",
+                ),
+                cls="stats-grid",
+            ),
+            P(f"Celková veľkosť extrahovaných dát: {format_size(stats['total_size'])}"),
+            P(f"ID operacie: {operation_id}"),
+            P(f"Log: {log_path}"),
+            cls="stats",
+        ),
+        Div(H3("Detail operácií"), *result_items, cls="results"),
+        A("← Nová extrakcia", href="/", cls="back-link"),
+        cls="container",
+    )
+
+
+@rt("/cleanup")
+def post(directory: str, recursive: str | None = None):
+    """Delete ZIP files that were extracted successfully."""
+    is_recursive = recursive is not None
+    path = Path(directory).expanduser().resolve()
+
+    if not path.exists():
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(f"Adresár '{directory}' neexistuje!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    if not path.is_dir():
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(f"'{directory}' nie je adresár!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    is_allowed, message = validate_base_dir(path)
+    if not is_allowed:
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(message, cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    zip_files = find_zip_files(path, is_recursive)
+    first_zip = next(zip_files, None)
+    if first_zip is None:
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+    zip_files = itertools.chain([first_zip], zip_files)
+
+    operation_id = uuid.uuid4().hex[:8]
+    log_path = LOG_DIR / f"cleanup_{operation_id}.log"
+    log_event(log_path, f"Start cistenia v {path}")
+
+    stats = {
+        "found": 0,
+        "extracted": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "failed": 0,
+        "freed_size": 0,
+    }
+    results = []
+
+    for zip_file in zip_files:
+        stats["found"] += 1
+        check_result = is_zip_extracted(zip_file)
+
+        if check_result["can_delete"]:
+            stats["extracted"] += 1
+            delete_result = delete_zip_file(zip_file)
+            if delete_result["deleted"]:
+                stats["deleted"] += 1
+                stats["freed_size"] += delete_result["freed_size"]
+                results.append(
+                    {
+                        "path": zip_file,
+                        "status": "deleted",
+                        "message": f"Vymazaný (uvoľnené {format_size(delete_result['freed_size'])})",
+                    }
+                )
+                log_event(log_path, f"OK: {zip_file} - deleted")
+            else:
+                stats["failed"] += 1
+                results.append(
+                    {
+                        "path": zip_file,
+                        "status": "error",
+                        "message": f"Chyba mazania: {delete_result['message']}",
+                    }
+                )
+                log_event(log_path, f"ERROR: {zip_file} - {delete_result['message']}")
+        else:
+            stats["skipped"] += 1
+            results.append(
+                {
+                    "path": zip_file,
+                    "status": "skipped",
+                    "message": f"Preskočený: {check_result['message']}",
+                }
+            )
+            log_event(log_path, f"SKIP: {zip_file} - {check_result['message']}")
+
+    result_items = []
+    for r in results:
+        relative_path = r["path"].relative_to(path) if r["path"].is_relative_to(path) else r["path"]
+        if r["status"] == "deleted":
+            result_items.append(Div(f"✓ {relative_path} - {r['message']}", cls="result-item success"))
+        elif r["status"] == "skipped":
+            result_items.append(Div(f"⚠ {relative_path} - {r['message']}", cls="result-item warning"))
+        else:
+            result_items.append(Div(f"✗ {relative_path} - {r['message']}", cls="result-item error"))
+
+    return Titled(
+        "ZIP Extractor - Čistenie",
+        Div(
+            H2("Štatistika čistenia"),
+            Div(
+                Div(Div(str(stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
+                Div(Div(str(stats["deleted"]), cls="stat-value"), Div("Vymazaných", cls="stat-label"), cls="stat-item"),
+                Div(Div(str(stats["skipped"]), cls="stat-value"), Div("Preskočených", cls="stat-label"), cls="stat-item"),
+                Div(Div(str(stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+                cls="stats-grid",
+            ),
+            P(f"Uvoľnené miesto: {format_size(stats['freed_size'])}"),
+            P(f"ID operacie: {operation_id}"),
+            P(f"Log: {log_path}"),
+            cls="stats",
+        ),
+        Div(H3("Detail operácií"), *result_items, cls="results"),
+        A("← Späť", href="/", cls="back-link"),
+        cls="container",
+    )
