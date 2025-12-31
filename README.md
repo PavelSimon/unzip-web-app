@@ -39,3 +39,7 @@ Otvor `http://localhost:5001` (default FastHTML).
 
 ## Pravidla prace
 Pozri `PROJECT_RULES.md`.
+
+## Verification
+- Manualna extrakcia: vytvoreny `test_data/sample.zip` a uspesne rozbaleny do `test_data/sample/`
+- Log: `logs/manual_extract.log`
