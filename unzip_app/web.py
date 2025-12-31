@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from threading import Lock, Thread
 from typing import Iterable
-import itertools
 import subprocess
 import uuid
 
@@ -298,13 +297,14 @@ def _collect_results(
     process_zip,
     use_parallel: bool,
 ) -> None:
+    zip_list = list(zip_files)
+    operation.total = len(zip_list)
+    if not zip_list:
+        operation.message = "V zadanom adresári sa nenašli žiadne ZIP súbory."
+        operation.status = "done"
+        return
+
     if use_parallel:
-        zip_list = list(zip_files)
-        operation.total = len(zip_list)
-        if not zip_list:
-            operation.message = "V zadanom adresári sa nenašli žiadne ZIP súbory."
-            operation.status = "done"
-            return
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_list}
             for future in as_completed(futures):
@@ -313,15 +313,10 @@ def _collect_results(
                 result = future.result()
                 _apply_result(operation, result)
     else:
-        found_any = False
-        for zip_file in zip_files:
-            found_any = True
+        for zip_file in zip_list:
             operation.current = str(zip_file)
             result = process_zip(zip_file)
             _apply_result(operation, result)
-        if not found_any:
-            operation.message = "V zadanom adresári sa nenašli žiadne ZIP súbory."
-            operation.status = "done"
 
 
 def run_extraction(operation_id: str) -> None:
