@@ -37,6 +37,7 @@ Otvor `http://localhost:5001` (default FastHTML).
 - Extrakcia do docasneho adresara a atomicke premenovanie.
 - Logy operacii v `UNZIP_LOG_DIR` s ID operacie.
   - Adresar `logs/` je v `.gitignore`.
+  - Logy je bezpecne cistit.
 
 ## Pravidla prace
 Pozri `PROJECT_RULES.md`.
