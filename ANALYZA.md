@@ -137,6 +137,7 @@ Po dokončení zobraziť:
 - `UNZIP_MAX_FILE_SIZE` - max velkost jedneho suboru (bytes)
 - `UNZIP_MAX_COMPRESSION_RATIO` - max kompresny pomer
 - `UNZIP_MAX_ZIP_SIZE` - max velkost ZIP suboru (bytes)
+- `UNZIP_MAX_WORKERS` - max pocet workerov pre paralelnu extrakciu
 
 ---
 

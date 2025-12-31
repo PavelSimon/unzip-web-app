@@ -6,6 +6,8 @@ Postavené na FastHTML frameworku
 from fasthtml.common import *
 from pathlib import Path, PurePosixPath
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import itertools
 import os
 import shutil
 import stat
@@ -180,6 +182,7 @@ MAX_FILES = int(os.environ.get("UNZIP_MAX_FILES", "10000"))
 MAX_FILE_SIZE = int(os.environ.get("UNZIP_MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100MB
 MAX_COMPRESSION_RATIO = float(os.environ.get("UNZIP_MAX_COMPRESSION_RATIO", "200"))
 MAX_ZIP_SIZE = int(os.environ.get("UNZIP_MAX_ZIP_SIZE", str(2 * 1024 * 1024 * 1024)))  # 2GB
+MAX_WORKERS = int(os.environ.get("UNZIP_MAX_WORKERS", str(min(4, (os.cpu_count() or 1)))))
 
 
 def log_event(log_path: Path, message: str) -> None:
@@ -251,12 +254,20 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
-def find_zip_files(directory: Path, recursive: bool = True) -> list[Path]:
-    """Nájde všetky ZIP súbory v adresári."""
+def find_zip_files(directory: Path, recursive: bool = True):
+    """Nájde všetky ZIP súbory v adresári (generator)."""
     if recursive:
-        return list(directory.rglob("*.zip"))
+        for root, _, files in os.walk(directory, onerror=lambda _: None):
+            for name in files:
+                if name.lower().endswith(".zip"):
+                    yield Path(root) / name
     else:
-        return list(directory.glob("*.zip"))
+        try:
+            for entry in directory.iterdir():
+                if entry.is_file() and entry.name.lower().endswith(".zip"):
+                    yield entry
+        except PermissionError:
+            return
 
 
 def extract_zip(zip_path: Path, conflict_policy: str, log_path: Path | None = None) -> dict:
@@ -401,14 +412,16 @@ def is_zip_extracted(zip_path: Path) -> dict:
             zip_members = set()
             for info in zf.infolist():
                 if not info.is_dir():
-                    zip_members.add(info.filename)
+                    zip_members.add(normalize_member_path(info.filename).as_posix())
 
-            # Kontrola, či všetky súbory existujú
-            missing_files = []
-            for member in zip_members:
-                member_path = extract_dir / member
-                if not member_path.exists():
-                    missing_files.append(member)
+            # Kontrola, ci vsetky subory existuju (jedna mapa)
+            existing_files = set()
+            for file_path in extract_dir.rglob("*"):
+                if file_path.is_file():
+                    rel_path = file_path.relative_to(extract_dir).as_posix()
+                    existing_files.add(rel_path)
+
+            missing_files = [member for member in zip_members if member not in existing_files]
 
             if missing_files:
                 result["message"] = f"Chýba {len(missing_files)} súborov"
@@ -573,8 +586,8 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
 
     # Vyhľadanie ZIP súborov
     zip_files = find_zip_files(path, is_recursive)
-
-    if not zip_files:
+    first_zip = next(zip_files, None)
+    if first_zip is None:
         return Titled("ZIP Extractor",
             Div(
                 Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
@@ -582,6 +595,7 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
                 cls="container"
             )
         )
+    zip_files = itertools.chain([first_zip], zip_files)
 
     operation_id = uuid.uuid4().hex[:8]
     log_path = LOG_DIR / f"extract_{operation_id}.log"
@@ -589,7 +603,7 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
 
     # Extrakcia a zbieranie štatistík
     stats = {
-        "found": len(zip_files),
+        "found": 0,
         "success": 0,
         "failed": 0,
         "skipped": 0,
@@ -598,18 +612,35 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
     }
     results = []
 
-    for zip_file in zip_files:
-        result = extract_zip(zip_file, conflict_policy, log_path)
-        results.append(result)
+    def process_zip(zip_file: Path) -> dict:
+        return extract_zip(zip_file, conflict_policy, log_path)
 
-        if result["success"]:
-            stats["success"] += 1
-            stats["total_files"] += result["files_count"]
-            stats["total_size"] += result["total_size"]
-        elif result["skipped"]:
-            stats["skipped"] += 1
-        else:
-            stats["failed"] += 1
+    if MAX_WORKERS > 1:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for result in executor.map(process_zip, zip_files):
+                results.append(result)
+                stats["found"] += 1
+                if result["success"]:
+                    stats["success"] += 1
+                    stats["total_files"] += result["files_count"]
+                    stats["total_size"] += result["total_size"]
+                elif result["skipped"]:
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+    else:
+        for zip_file in zip_files:
+            result = process_zip(zip_file)
+            results.append(result)
+            stats["found"] += 1
+            if result["success"]:
+                stats["success"] += 1
+                stats["total_files"] += result["files_count"]
+                stats["total_size"] += result["total_size"]
+            elif result["skipped"]:
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
 
     # Vytvorenie výstupu
     result_items = []
@@ -711,8 +742,8 @@ def post(directory: str, recursive: str | None = None):
 
     # Vyhľadanie ZIP súborov
     zip_files = find_zip_files(path, is_recursive)
-
-    if not zip_files:
+    first_zip = next(zip_files, None)
+    if first_zip is None:
         return Titled("ZIP Extractor",
             Div(
                 Div("V zadanom adresári sa nenašli žiadne ZIP súbory.", cls="info-message"),
@@ -720,6 +751,7 @@ def post(directory: str, recursive: str | None = None):
                 cls="container"
             )
         )
+    zip_files = itertools.chain([first_zip], zip_files)
 
     operation_id = uuid.uuid4().hex[:8]
     log_path = LOG_DIR / f"cleanup_{operation_id}.log"
@@ -727,7 +759,7 @@ def post(directory: str, recursive: str | None = None):
 
     # Kontrola a mazanie
     stats = {
-        "found": len(zip_files),
+        "found": 0,
         "extracted": 0,
         "deleted": 0,
         "skipped": 0,
@@ -737,6 +769,7 @@ def post(directory: str, recursive: str | None = None):
     results = []
 
     for zip_file in zip_files:
+        stats["found"] += 1
         # Najprv overíme, či je ZIP extrahovaný
         check_result = is_zip_extracted(zip_file)
 
