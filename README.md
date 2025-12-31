@@ -14,6 +14,17 @@ uv pip install -r requirements.txt
 uv run python main.py
 ```
 
+Alternativy:
+```bash
+make setup
+make run
+```
+
+alebo:
+```bash
+./scripts/run.sh
+```
+
 Otvor `http://localhost:5001` (default FastHTML).
 
 ## Pouzitie
