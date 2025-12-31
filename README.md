@@ -31,6 +31,7 @@ Otvor `http://localhost:5001` (default FastHTML).
 - Zadaj cestu k adresaru.
 - Zvol politiku konfliktu cieloveho priecinka: skip/overwrite/suffix.
 - Volitelne zapni paralelnu extrakciu.
+- Volitelne pouzi "Extrahovat a vymazat ZIP subory" pre okamzite cistenie.
 - Po spusteni extrakcie sa zobrazi priebeh s poctom spracovanych ZIP a stranka sa automaticky aktualizuje.
 - Spusti extrakciu alebo cistenie ZIP suborov.
 

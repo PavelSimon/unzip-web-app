@@ -213,6 +213,7 @@ class Operation:
     conflict_policy: str
     recursive: bool
     parallel: bool
+    delete_after: bool
     log_path: Path
     stats: dict[str, int] = field(
         default_factory=lambda: {
@@ -222,6 +223,9 @@ class Operation:
             "skipped": 0,
             "total_files": 0,
             "total_size": 0,
+            "deleted": 0,
+            "delete_failed": 0,
+            "freed_size": 0,
         }
     )
     results: list[dict[str, object]] = field(default_factory=list)
@@ -278,6 +282,28 @@ def get():
     return FileResponse(FAVICON_PATH, media_type="image/x-icon")
 
 
+def _result_style(operation: Operation, result: dict[str, object]) -> str:
+    if result["success"]:
+        if operation.delete_after and result.get("delete_status") == "error":
+            return "result-item warning"
+        return "result-item success"
+    if result["skipped"]:
+        return "result-item warning"
+    return "result-item error"
+
+
+def _result_message(operation: Operation, result: dict[str, object]) -> str:
+    message = str(result["message"])
+    if operation.delete_after and result.get("delete_status"):
+        if result["delete_status"] == "deleted":
+            message = f"{message} | ZIP vymazany"
+        else:
+            delete_message = result.get("delete_message", "")
+            suffix = f": {delete_message}" if delete_message else ""
+            message = f"{message} | vymazanie zlyhalo{suffix}"
+    return message
+
+
 def _apply_result(operation: Operation, result: dict[str, object]) -> None:
     operation.results.append(result)
     operation.stats["found"] += 1
@@ -327,7 +353,20 @@ def run_extraction(operation_id: str) -> None:
         log_event(operation.log_path, f"Start extrakcie v {operation.path}")
 
         def process_zip(zip_file: Path) -> dict:
-            return extract_zip(zip_file, operation.conflict_policy, operation.log_path)
+            result = extract_zip(zip_file, operation.conflict_policy, operation.log_path)
+            if operation.delete_after and result["success"]:
+                delete_result = delete_zip_file(zip_file)
+                if delete_result["deleted"]:
+                    result["delete_status"] = "deleted"
+                    operation.stats["deleted"] += 1
+                    operation.stats["freed_size"] += int(delete_result["freed_size"])
+                    log_event(operation.log_path, f"OK: {zip_file} - deleted")
+                else:
+                    result["delete_status"] = "error"
+                    result["delete_message"] = delete_result["message"]
+                    operation.stats["delete_failed"] += 1
+                    log_event(operation.log_path, f"ERROR: {zip_file} - delete failed: {delete_result['message']}")
+            return result
 
         zip_files = find_zip_files(operation.path, operation.recursive)
         use_parallel = operation.parallel and MAX_WORKERS > 1
@@ -347,12 +386,9 @@ def _result_items(operation: Operation) -> list:
             if result["path"].is_relative_to(operation.path)
             else result["path"]
         )
-        if result["success"]:
-            result_items.append(Div(f"✓ {relative_path} - {result['message']}", cls="result-item success"))
-        elif result["skipped"]:
-            result_items.append(Div(f"⚠ {relative_path} - {result['message']}", cls="result-item warning"))
-        else:
-            result_items.append(Div(f"✗ {relative_path} - {result['message']}", cls="result-item error"))
+        prefix = "✓" if result["success"] else "⚠" if result["skipped"] else "✗"
+        message = _result_message(operation, result)
+        result_items.append(Div(f"{prefix} {relative_path} - {message}", cls=_result_style(operation, result)))
     return result_items
 
 
@@ -369,23 +405,36 @@ def render_progress(operation: Operation) -> object:
 
     current = P(f"Aktuálne: {Path(operation.current).name}") if operation.current else ""
 
+    stat_items = [
+        Div(Div(str(operation.stats["success"]), cls="stat-value"), Div("Úspešne", cls="stat-label"), cls="stat-item"),
+        Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+        Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
+        Div(
+            Div(str(operation.stats["total_files"]), cls="stat-value"),
+            Div("Extrahovaných súborov", cls="stat-label"),
+            cls="stat-item",
+        ),
+    ]
+    if operation.delete_after:
+        stat_items.append(
+            Div(Div(str(operation.stats["deleted"]), cls="stat-value"), Div("Vymazané ZIP", cls="stat-label"), cls="stat-item")
+        )
+        stat_items.append(
+            Div(
+                Div(str(operation.stats["delete_failed"]), cls="stat-value"),
+                Div("Zlyhané mazanie", cls="stat-label"),
+                cls="stat-item",
+            )
+        )
+
     return Div(
         H2("Prebieha extrakcia"),
         progress_bar,
         progress_label,
         current,
-        Div(
-            Div(Div(str(operation.stats["success"]), cls="stat-value"), Div("Úspešne", cls="stat-label"), cls="stat-item"),
-            Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
-            Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
-            Div(
-                Div(str(operation.stats["total_files"]), cls="stat-value"),
-                Div("Extrahovaných súborov", cls="stat-label"),
-                cls="stat-item",
-            ),
-            cls="stats-grid",
-        ),
+        Div(*stat_items, cls="stats-grid"),
         P(f"Celková veľkosť extrahovaných dát: {format_size(operation.stats['total_size'])}"),
+        P(f"Uvoľnené miesto: {format_size(operation.stats['freed_size'])}") if operation.delete_after else "",
         P(f"ID operácie: {operation.operation_id}"),
         P(f"Log: {operation.log_path}"),
         cls="stats",
@@ -396,27 +445,40 @@ def render_results(operation: Operation) -> object:
     if operation.message:
         return Div(Div(operation.message, cls="info-message"), A("← Späť", href="/", cls="back-link"))
 
+    stat_items = [
+        Div(Div(str(operation.stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
+        Div(
+            Div(str(operation.stats["success"]), cls="stat-value"),
+            Div("Úspešne extrahovaných", cls="stat-label"),
+            cls="stat-item",
+        ),
+        Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
+        Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
+        Div(
+            Div(str(operation.stats["total_files"]), cls="stat-value"),
+            Div("Extrahovaných súborov", cls="stat-label"),
+            cls="stat-item",
+        ),
+    ]
+    if operation.delete_after:
+        stat_items.append(
+            Div(Div(str(operation.stats["deleted"]), cls="stat-value"), Div("Vymazané ZIP", cls="stat-label"), cls="stat-item")
+        )
+        stat_items.append(
+            Div(
+                Div(str(operation.stats["delete_failed"]), cls="stat-value"),
+                Div("Zlyhané mazanie", cls="stat-label"),
+                cls="stat-item",
+            )
+        )
+
     result_items = _result_items(operation)
     return Div(
         Div(
             H2("Štatistika"),
-            Div(
-                Div(Div(str(operation.stats["found"]), cls="stat-value"), Div("Nájdených ZIP", cls="stat-label"), cls="stat-item"),
-                Div(
-                    Div(str(operation.stats["success"]), cls="stat-value"),
-                    Div("Úspešne extrahovaných", cls="stat-label"),
-                    cls="stat-item",
-                ),
-                Div(Div(str(operation.stats["failed"]), cls="stat-value"), Div("Zlyhané", cls="stat-label"), cls="stat-item"),
-                Div(Div(str(operation.stats["skipped"]), cls="stat-value"), Div("Preskočené", cls="stat-label"), cls="stat-item"),
-                Div(
-                    Div(str(operation.stats["total_files"]), cls="stat-value"),
-                    Div("Extrahovaných súborov", cls="stat-label"),
-                    cls="stat-item",
-                ),
-                cls="stats-grid",
-            ),
+            Div(*stat_items, cls="stats-grid"),
             P(f"Celková veľkosť extrahovaných dát: {format_size(operation.stats['total_size'])}"),
+            P(f"Uvoľnené miesto: {format_size(operation.stats['freed_size'])}") if operation.delete_after else "",
             P(f"ID operácie: {operation.operation_id}"),
             P(f"Log: {operation.log_path}"),
             cls="stats",
@@ -494,6 +556,12 @@ def get():
                 Div(
                     Button("Extrahovať ZIP súbory", type="submit", formaction="/extract"),
                     Button(
+                        "Extrahovať a vymazať ZIP súbory",
+                        type="submit",
+                        formaction="/extract-delete",
+                        cls="btn-danger",
+                    ),
+                    Button(
                         "Vymazať extrahované ZIP súbory",
                         type="submit",
                         formaction="/cleanup",
@@ -504,6 +572,48 @@ def get():
                 method="post",
             ),
             P(f"Povoleny root: {BASE_DIR}" if not ALLOW_ANY_PATH else "Povoleny root: (neobmedzeny)"),
+            cls="container",
+        ),
+    )
+
+
+def start_extraction_response(
+    path: Path,
+    conflict_policy: str,
+    is_recursive: bool,
+    use_parallel: bool,
+    delete_after: bool,
+) -> object:
+    operation_id = uuid.uuid4().hex[:8]
+    log_prefix = "extract_delete" if delete_after else "extract"
+    log_path = LOG_DIR / f"{log_prefix}_{operation_id}.log"
+    operation = Operation(
+        operation_id=operation_id,
+        path=path,
+        conflict_policy=conflict_policy,
+        recursive=is_recursive,
+        parallel=use_parallel,
+        delete_after=delete_after,
+        log_path=log_path,
+    )
+    store_operation(operation)
+    Thread(target=run_extraction, args=(operation_id,), daemon=True).start()
+
+    message = (
+        "Extrakcia s vymazaním beží na pozadí. Stránka sa bude automaticky aktualizovať."
+        if delete_after
+        else "Extrakcia beží na pozadí. Stránka sa bude automaticky aktualizovať."
+    )
+    return Titled(
+        "ZIP Extractor - Priebeh",
+        Div(
+            Div(message, cls="info-message"),
+            Div(
+                id=f"operation-{operation_id}",
+                hx_get=f"/status/{operation_id}",
+                hx_trigger="load, every 1s",
+                hx_swap="outerHTML",
+            ),
             cls="container",
         ),
     )
@@ -547,35 +657,48 @@ def post(directory: str, recursive: str | None = None, conflict_policy: str = "s
             ),
         )
 
-    operation_id = uuid.uuid4().hex[:8]
-    log_path = LOG_DIR / f"extract_{operation_id}.log"
-    operation = Operation(
-        operation_id=operation_id,
-        path=path,
-        conflict_policy=conflict_policy,
-        recursive=is_recursive,
-        parallel=use_parallel,
-        log_path=log_path,
-    )
-    store_operation(operation)
-    Thread(target=run_extraction, args=(operation_id,), daemon=True).start()
+    return start_extraction_response(path, conflict_policy, is_recursive, use_parallel, delete_after=False)
 
-    return Titled(
-        "ZIP Extractor - Priebeh",
-        Div(
+
+@rt("/extract-delete")
+def post(directory: str, recursive: str | None = None, conflict_policy: str = "skip", parallel: str | None = None):
+    """Handle ZIP extraction and delete the zip afterwards."""
+    is_recursive = recursive is not None
+    use_parallel = parallel is not None and MAX_WORKERS > 1
+    path = Path(directory).expanduser().resolve()
+
+    if not path.exists():
+        return Titled(
+            "ZIP Extractor",
             Div(
-                "Extrakcia beží na pozadí. Stránka sa bude automaticky aktualizovať.",
-                cls="info-message",
+                Div(f"Adresár '{directory}' neexistuje!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
             ),
+        )
+
+    if not path.is_dir():
+        return Titled(
+            "ZIP Extractor",
             Div(
-                id=f"operation-{operation_id}",
-                hx_get=f"/status/{operation_id}",
-                hx_trigger="load, every 1s",
-                hx_swap="outerHTML",
+                Div(f"'{directory}' nie je adresár!", cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
             ),
-            cls="container",
-        ),
-    )
+        )
+
+    is_allowed, message = validate_base_dir(path)
+    if not is_allowed:
+        return Titled(
+            "ZIP Extractor",
+            Div(
+                Div(message, cls="error-message"),
+                A("← Späť", href="/", cls="back-link"),
+                cls="container",
+            ),
+        )
+
+    return start_extraction_response(path, conflict_policy, is_recursive, use_parallel, delete_after=True)
 
 
 @rt("/status/{operation_id}")
